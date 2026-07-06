@@ -4,143 +4,85 @@ autocvd(num_gpus=1)
 # ruff: noqa: E402
 # =======================
 
-# numerics
-import jax
-import jax.numpy as jnp
-from jax.random import PRNGKey, uniform
+# ==========================================================================
+#  KHI dataset generation
+#
+#  Generates final-state Kelvin-Helmholtz snapshots with astronomix and
+#  stores them as (4, 256, 256) arrays (density, velocity_x, velocity_y,
+#  pressure) into the ``data/`` folder (a symlink to a large partition).
+#
+#  Simulations are batched with jax.vmap for throughput.
+# ==========================================================================
 
-# timing
+import argparse
+import os
 from timeit import default_timer as timer
 
-# plotting
-import matplotlib.pyplot as plt
-from matplotlib.gridspec import GridSpec
-from matplotlib.colors import LogNorm
-import matplotlib.animation as animation
-from jaxtyping import Array, Float, Int
+import jax
+import jax.numpy as jnp
+import numpy as np
+from jax.random import PRNGKey
 
-# astronomix
-from astronomix import SimulationConfig
-from astronomix import get_helper_data
-from astronomix import SimulationParams
-from astronomix import time_integration
-from astronomix.option_classes.simulation_config import SnapshotSettings
-from astronomix import construct_primitive_state
-from astronomix import get_registered_variables
-from astronomix.option_classes.simulation_config import finalize_config
+from astronomix import (
+    SimulationConfig,
+    SimulationParams,
+    construct_primitive_state,
+    get_helper_data,
+    get_registered_variables,
+    time_integration,
+)
 from astronomix.option_classes.simulation_config import (
-    BACKWARDS,
     DOUBLE_MINMOD,
+    FINITE_VOLUME,
     FORWARDS,
-    HLL,
-    HLLC,
     HYBRID_HLLC,
-    MINMOD,
-    OSHER,
     PERIODIC_BOUNDARY,
     BoundarySettings,
     BoundarySettings1D,
-    FINITE_VOLUME,
-    FINITE_DIFFERENCE
+    finalize_config,
 )
-
-# model
-import equinox as eqx
-
-# training
-import optax
-
 from astronomix.variable_registry.registered_variables import StaticIntVector
-print("👷 Setting up simulation...")
 
-# simulation settings
-gamma = 5/3
+# ==========================================================================
+#  simulation configuration
+# ==========================================================================
 
-# spatial domain
-box_size = 1.0
-num_cells = 256
+NUM_CELLS = 256
+BOX_SIZE = 1.0
 
-fixed_timestep = False
-scale_time = False
-dt_max = 0.1
-num_timesteps = 2000
-
-# setup simulation config
 config = SimulationConfig(
-    progress_bar = False,
-    dimensionality = 2,
-    box_size = box_size,
-    num_cells = StaticIntVector(x=num_cells, y=num_cells),
-    fixed_timestep = fixed_timestep,
-    differentiation_mode = FORWARDS,
-    num_timesteps = num_timesteps,
-    boundary_settings = BoundarySettings(
-        x = BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY),
-        y = BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY)
+    progress_bar=False,
+    dimensionality=2,
+    box_size=BOX_SIZE,
+    num_cells=StaticIntVector(x=NUM_CELLS, y=NUM_CELLS),
+    fixed_timestep=False,
+    differentiation_mode=FORWARDS,
+    num_timesteps=2000,
+    boundary_settings=BoundarySettings(
+        x=BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY),
+        y=BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY),
     ),
-    limiter = DOUBLE_MINMOD,
-    return_snapshots = False,
-    riemann_solver = HYBRID_HLLC,
-    solver_mode = FINITE_VOLUME
+    limiter=DOUBLE_MINMOD,
+    return_snapshots=False,
+    riemann_solver=HYBRID_HLLC,
+    solver_mode=FINITE_VOLUME,
 )
 
 helper_data = get_helper_data(config)
-
-params = SimulationParams(
-    t_end = 2.0,
-    C_cfl = 0.4
-)
-
+params = SimulationParams(t_end=2.0, C_cfl=0.4)
 registered_variables = get_registered_variables(config)
 
-def produce_plot(final_state, index):
-  s = 0.1
+x = jnp.linspace(0, BOX_SIZE, NUM_CELLS)
+y = jnp.linspace(0, BOX_SIZE, NUM_CELLS)
+X, Y = jnp.meshgrid(x, y, indexing="ij")
 
-  fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
 
-  # equal aspect ratio
-  ax1.set_aspect('equal', 'box')
-  ax2.set_aspect('equal', 'box')
-  ax3.set_aspect('equal', 'box')
-
-  x = jnp.linspace(0, box_size, num_cells)
-  y = jnp.linspace(0, box_size, num_cells)
-
-  ym, xm = jnp.meshgrid(x, y)
-
-  # on the first axis plot the density
-  # log scaler
-  norm_rho = LogNorm(vmin = jnp.min(final_state[0, :, :]), vmax = jnp.max(final_state[0, :, :]), clip = True)
-  norm_p = LogNorm(vmin = jnp.min(final_state[3, :, :]), vmax = jnp.max(final_state[3, :, :]), clip = True)
-
-  # ax1.scatter(xm.flatten(), ym.flatten(), c = final_state[0, :, :].flatten(), s = s, norm = norm_rho, marker = "s", cmap = "jet")
-  # ax1.set_title("Density")
-
-  ax1.imshow(final_state[0, :, :].T, norm = norm_rho, cmap = "jet", origin = "lower", extent = [0, box_size, 0, box_size])
-  ax1.set_title("Density")
-
-  # on the second axis plot the absolute velocity
-  # abs_vel = jnp.sqrt(final_state[1, :, :]**2 + final_state[2, :, :]**2)
-
-  # vel_norm = LogNorm(vmin = jnp.min(abs_vel), vmax = jnp.max(abs_vel), clip = True)
-
-  ax2.imshow(final_state[1, :, :].T, cmap = "jet", origin = "lower", extent = [0, box_size, 0, box_size])
-  ax2.set_title("Velocity")
-
-  # on the third axis plot the pressure
-  ax3.imshow(final_state[4, :, :].T, norm = norm_p, cmap = "jet", origin = "lower", extent = [0, box_size, 0, box_size])
-  ax3.set_title("Pressure")
-
-  plt.savefig(f"final_state_{index}.png")
-
-"""## 2. KHI Init
-
-"""
+# ==========================================================================
+#  KHI initial condition
+# ==========================================================================
 
 def random_khi_fourier_modes(
     key,
-    X,
-    Y,
     amplitude=0.01,
     k_min=1,
     k_max=8,
@@ -148,123 +90,118 @@ def random_khi_fourier_modes(
     width=0.03,
     spectral_slope=1.0,
 ):
-    """
-    Random Fourier-mode perturbation for Kelvin-Helmholtz initialization.
-
-    Produces a y-velocity perturbation of the form
-
-        u_y(x, y) = A f(y) sum_k a_k sin(2 pi k x + phi_k)
-
-    where f(y) localizes the perturbation around the shear layers.
-    """
-
+    """Random Fourier-mode y-velocity perturbation for KHI seeding."""
     modes = jnp.arange(k_min, k_max + 1)
     num_modes = modes.shape[0]
 
     key_amp, key_phase = jax.random.split(key)
 
-    # random amplitudes with optional spectral decay
-    coeffs = jax.random.normal(key_amp, (num_modes,))
-    coeffs = coeffs / modes**spectral_slope
-
-    # normalize so amplitude is controlled by `amplitude`
+    coeffs = jax.random.normal(key_amp, (num_modes,)) / modes**spectral_slope
     coeffs = coeffs / jnp.sqrt(jnp.sum(coeffs**2) + 1e-30)
 
-    phases = jax.random.uniform(
-        key_phase,
-        (num_modes,),
-        minval=0.0,
-        maxval=2.0 * jnp.pi,
-    )
+    phases = jax.random.uniform(key_phase, (num_modes,), minval=0.0, maxval=2.0 * jnp.pi)
 
-    # shape: (num_modes, nx, ny)
     fourier_sum = jnp.sum(
         coeffs[:, None, None]
         * jnp.sin(2.0 * jnp.pi * modes[:, None, None] * X[None, :, :] + phases[:, None, None]),
         axis=0,
     )
 
-    # localize perturbation around both shear layers
     envelope = jnp.zeros_like(Y)
     for y0 in shear_layers:
         envelope = envelope + jnp.exp(-0.5 * ((Y - y0) / width) ** 2)
 
     return amplitude * envelope * fourier_sum
 
-"""### 3 Data Generation
-In this step we generate the 256x256 KHI data which we train our model with. We went for _ images for a start.
-"""
 
-# Grid size and configuration
-num_cells = config.num_cells
-x = jnp.linspace(0, 1, num_cells.x)
-y = jnp.linspace(0, 1, num_cells.y)
-X, Y = jnp.meshgrid(x, y, indexing="ij")
+def make_initial_state(key):
+    """Construct a KHI primitive initial state with a random perturbation."""
+    rho = jnp.ones_like(X)
+    u_x = 0.5 * jnp.ones_like(X)
 
-# Initialize state
-rho = jnp.ones_like(X)
-u_x = 0.5 * jnp.ones_like(X)
+    mask = (Y > 0.25) & (Y < 0.75)
+    u_x = jnp.where(mask, -0.5, u_x)
+    rho = jnp.where(mask, 2.0, rho)
 
-# deterministic setup
-# u_y = 0.01 * jnp.sin(2 * jnp.pi * X)
+    u_y = random_khi_fourier_modes(key)
+    p = jnp.ones((NUM_CELLS, NUM_CELLS)) * 2.5
 
-# random initialization
-key = PRNGKey(0)
-num_sims = 100000
+    return construct_primitive_state(
+        config=config,
+        registered_variables=registered_variables,
+        density=rho,
+        velocity_x=u_x,
+        velocity_y=u_y,
+        gas_pressure=p,
+    )
 
-# training data (num_sims x matrix of dim num_cells x num_cells)
-data = jnp.zeros((num_sims, num_cells.x, num_cells.x))
 
-for i in range(num_sims):
-  print("finished iteration", i)
-  key, subkey = jax.random.split(key)
+# finalize config against a representative state shape
+_init0 = make_initial_state(PRNGKey(0))
+config = finalize_config(config, _init0.shape)
 
-  # Base state
-  rho = jnp.ones_like(X)
-  u_x = 0.5 * jnp.ones_like(X)
 
-  # Slab mask
-  mask = (Y > 0.25) & (Y < 0.75)
+@jax.jit
+@jax.vmap
+def simulate_batch(initial_states):
+    return time_integration(initial_states, config, params, registered_variables)
 
-  # between y = 0.25 and y = 0.75 set u_x to -0.5 and rho to 2.0
-  u_x = jnp.where(mask, -0.5, u_x)
-  rho = jnp.where(mask, 2.0, rho)
 
-  # KHI-suited random Fourier perturbation
-  u_y = random_khi_fourier_modes(
-      subkey,
-      X,
-      Y,
-      amplitude=0.01,
-      k_min=1,
-      k_max=8,
-      shear_layers=(0.25, 0.75),
-      width=0.03,
-      spectral_slope=1.0,
-  )
+# ==========================================================================
+#  generation loop
+# ==========================================================================
 
-  # Initialize pressure
-  p = jnp.ones((num_cells.x, num_cells.x)) * 2.5
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--num-samples", type=int, default=1000)
+    parser.add_argument("--batch-size", type=int, default=10)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--out-dir", type=str, default="data")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="regenerate even if the output file already exists")
+    args = parser.parse_args()
 
-  # Initial state
-  initial_state = construct_primitive_state(
-      config=config,
-      registered_variables=registered_variables,
-      density=rho,
-      velocity_x=u_x,
-      velocity_y=u_y,
-      gas_pressure=p,
-  )
+    os.makedirs(args.out_dir, exist_ok=True)
 
-  config = finalize_config(config, initial_state.shape)
+    master_key = PRNGKey(args.seed)
+    n = args.num_samples
+    bs = args.batch_size
 
-  final_state = time_integration(
-      initial_state,
-      config,
-      params,
-      registered_variables,
-  )
+    t_start = timer()
+    done = 0
+    for batch_start in range(0, n, bs):
+        this_bs = min(bs, n - batch_start)
+        indices = list(range(batch_start, batch_start + this_bs))
 
-  jnp.save(f"100k_data/final_state_{i}", final_state)
-  plt.imshow(final_state[0, :, :])
-  plt.savefig(f"100k_figures/final_state{i}.png")
+        # skip fully-completed batches unless overwriting
+        paths = [os.path.join(args.out_dir, f"final_state_{i:05d}.npy") for i in indices]
+        if not args.overwrite and all(os.path.exists(p) for p in paths):
+            done += this_bs
+            continue
+
+        # deterministic per-sample keys (independent of batch size)
+        keys = jax.vmap(lambda i: jax.random.fold_in(master_key, i))(jnp.array(indices))
+        initial_states = jax.vmap(make_initial_state)(keys)
+
+        final_states = simulate_batch(initial_states)
+        final_states.block_until_ready()
+        final_states = np.asarray(final_states, dtype=np.float32)
+
+        if np.isnan(final_states).any():
+            bad = np.isnan(final_states).any(axis=(1, 2, 3))
+            print(f"⚠️  NaNs in batch {batch_start}: samples {np.array(indices)[bad]}")
+
+        for path, arr in zip(paths, final_states):
+            np.save(path, arr)  # shape (4, 256, 256)
+
+        done += this_bs
+        elapsed = timer() - t_start
+        rate = done / elapsed
+        eta = (n - done) / rate if rate > 0 else float("nan")
+        print(f"  {done:5d}/{n} done | {rate:5.2f} sim/s | ETA {eta/60:5.1f} min", flush=True)
+
+    print(f"✅ Generated {n} samples in {(timer() - t_start)/60:.1f} min -> {args.out_dir}/")
+
+
+if __name__ == "__main__":
+    main()

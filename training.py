@@ -4,231 +4,183 @@ autocvd(num_gpus=1)
 # ruff: noqa: E402
 # =======================
 
-
 # ==========================================================================
-#  import of libraries
+#  Rectified-flow training for the 4-channel KHI field sampler
+#
+#  Learns v(x_t, t) = x1 - x0 where x0 ~ N(0, I), x1 is a (normalised) KHI
+#  final state, and x_t = (1 - t) x0 + t x1.  Sampling then integrates this
+#  velocity field from noise (t=0) to data (t=1).
 # ==========================================================================
 
-# model
-from unet_models import unet_flow_film
+import argparse
+import glob
+import os
+
 import equinox as eqx
-import optax 
-
-# math
-import numpy as np
 import jax
 import jax.numpy as jnp
-
-# data
-import glob
-
-# visualization
+import numpy as np
+import optax
 import matplotlib.pyplot as plt
 
-# saving models
-import os
-os.makedirs("unet_checkpoints", exist_ok=True)
+from unet_models import unet_flow_film
 
 
 # ==========================================================================
-#  functions for training
+#  rectified-flow batch sampling
 # ==========================================================================
-
-"""### Generation of Data pairs
-1. Data batches are divided into single samples at the current time point t. The image x_t, time t itself and the target velocity v_target are returned.
-"""
 
 def sample_batch(key, data, batch_size):
-
+    """Draw a batch of (x_t, t, v_target) rectified-flow training triples."""
     keys = jax.random.split(key, batch_size)
 
     def single_sample(k):
-        
         key1, key2, key3 = jax.random.split(k, 3)
-
         idx = jax.random.randint(key1, (), 0, len(data))
-        
-        x1 = jax.lax.dynamic_index_in_dim(
-            data,
-            idx,
-            axis=0,
-            keepdims=False
-        )           # real KHI
-
-        x0 = jax.random.normal(key2, x1.shape)  # noise
-
+        x1 = jax.lax.dynamic_index_in_dim(data, idx, axis=0, keepdims=False)  # real KHI
+        x0 = jax.random.normal(key2, x1.shape)                                # noise
         t = jax.random.uniform(key3, ())
-
         x_t = (1 - t) * x0 + t * x1
-
-        v_target = x1 - x0   # clean rectified flow direction
-        
+        v_target = x1 - x0                                                    # rectified flow
         return x_t, t, v_target
-    
-    x_t, t, v_target = jax.vmap(single_sample)(keys)
 
-    return x_t, t, v_target
+    return jax.vmap(single_sample)(keys)
 
-"""### 2. Loss function
-For the loss a simple mean squared error is implemented.
-"""
 
 def loss_function(model, x_t, t, v_target):
-
-    batched_model = jax.vmap(model, in_axes=(0, 0))
-
-    v_pred = batched_model(x_t, t)
-
+    v_pred = jax.vmap(model)(x_t, t)
     return jnp.mean((v_pred - v_target) ** 2)
 
-"""### 3. Training step
-Using the optax library we set up the training of the model.
-"""
 
 @eqx.filter_jit
-def train_step(model, opt_state, x_t, t, v_target):
+def train_step(model, ema_model, opt_state, x_t, t, v_target, optimizer, ema_decay):
+    loss, grads = eqx.filter_value_and_grad(loss_function)(model, x_t, t, v_target)
+    updates, opt_state = optimizer.update(grads, opt_state, eqx.filter(model, eqx.is_array))
+    model = eqx.apply_updates(model, updates)
 
-  loss, grads = eqx.filter_value_and_grad(loss_function)(model, x_t, t, v_target)
-
-  updates, opt_state = optimizer.update(grads, opt_state, eqx.filter(model, eqx.is_array))
-
-  model = eqx.apply_updates(model, updates)
-
-  return model, opt_state, loss
-
-
-
-# ==========================================================================
-#  data import
-# ==========================================================================
-
-files = sorted(glob.glob("100k_data/final_state_*.npy"))
-
-# only load the density data first
-rho = np.stack([np.load(f)[0] for f in files]) 
-v_x = np.stack([np.load(f)[1] for f in files]) 
-v_y = np.stack([np.load(f)[2] for f in files]) 
-p = np.stack([np.load(f)[3] for f in files]) 
-
-# normalize data
-rho = (rho - rho.mean()) / rho.std()
-v_x = (v_x - v_x.mean()) / v_x.std()
-v_y = (v_y - v_y.mean()) / v_y.std()
-p = (p - p.mean()) / p.std()
-
-print(rho.mean(), rho.std())
-print(v_x.mean(), v_x.std())
-print(v_y.mean(), v_y.std())
-print(p.mean(), p.std())
-
-# put data in correct shape 
-data = jnp.stack([rho, v_x, v_y, p], axis=1)
-small_data = data[:4500]
-
-# just density for trouble shooting
-
-rho_small = rho[:4500]
-rho_small = rho_small[:, None, : , :]
-print(rho_small.shape)
-
-# ==========================================================================
-#  training setup
-# ==========================================================================
-
-# hyperparameters
-batch_size = 16
-epochs = 20000
-
-# set up model
-key_model = jax.random.key(10)
-model = unet_flow_film.create_model(key_model) 
-
-# set learning rate
-learning_rate = 3e-4
-optimizer = optax.adam(learning_rate)
-opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
-
-# fixed validation set
-val_key = jax.random.key(12345)
-
-x_val, t_val, v_val = sample_batch(
-    val_key,
-    rho_small,
-    batch_size=16
-)
-
-# ==========================================================================
-#  training loop
-# ==========================================================================
-
-key_training = jax.random.key(20)
-loss_history = []
-val_mse_history = []
-checkpoint_steps = {10000, 20000, 30000, 40000, 50000}
-
-for step in range(epochs + 1):
-
-    key, subkey = jax.random.split(key_training)
-
-    x_t, t, v_target = sample_batch(
-        subkey,
-        rho_small,
-        batch_size
+    # exponential moving average of the weights (used for sampling)
+    ema_model = jax.tree_util.tree_map(
+        lambda e, m: ema_decay * e + (1.0 - ema_decay) * m if eqx.is_array(e) else e,
+        ema_model, model,
     )
+    return model, ema_model, opt_state, loss
 
-    model, opt_state, loss = train_step(
-        model,
-        opt_state,
-        x_t,
-        t,
-        v_target
+
+# ==========================================================================
+#  data loading + normalisation
+# ==========================================================================
+
+def load_data(data_dir, max_samples=None):
+    files = sorted(glob.glob(os.path.join(data_dir, "final_state_*.npy")))
+    if max_samples is not None:
+        files = files[:max_samples]
+    if not files:
+        raise FileNotFoundError(f"No data found in {data_dir}/final_state_*.npy")
+
+    data = np.stack([np.load(f) for f in files]).astype(np.float32)  # (N, 4, 256, 256)
+
+    # per-channel standardisation
+    mean = data.mean(axis=(0, 2, 3), keepdims=True)  # (1, 4, 1, 1)
+    std = data.std(axis=(0, 2, 3), keepdims=True)
+    data = (data - mean) / std
+
+    return jnp.asarray(data), mean.squeeze(), std.squeeze()  # stats shape (4,)
+
+
+# ==========================================================================
+#  main
+# ==========================================================================
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data-dir", type=str, default="data")
+    parser.add_argument("--ckpt-dir", type=str, default="unet_checkpoints")
+    parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--steps", type=int, default=20000)
+    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--ema-decay", type=float, default=0.999)
+    parser.add_argument("--val-frac", type=float, default=0.1)
+    parser.add_argument("--seed", type=int, default=0)
+    args = parser.parse_args()
+
+    os.makedirs(args.ckpt_dir, exist_ok=True)
+
+    # ---- data ----
+    data, mean, std = load_data(args.data_dir, args.max_samples)
+    n_val = max(1, int(len(data) * args.val_frac))
+    train_data, val_data = data[n_val:], data[:n_val]
+    print(f"data: {data.shape}, train {len(train_data)}, val {len(val_data)}")
+    print("per-channel mean:", np.round(np.array(mean), 4))
+    print("per-channel std :", np.round(np.array(std), 4))
+
+    # save normalisation stats for sampling
+    np.savez(os.path.join(args.ckpt_dir, "norm_stats.npz"),
+             mean=np.array(mean), std=np.array(std))
+
+    # ---- model / optimiser ----
+    key = jax.random.key(args.seed)
+    key, mkey = jax.random.split(key)
+    model = unet_flow_film.create_model(mkey)
+    ema_model = model
+    n_params = sum(x.size for x in jax.tree_util.tree_leaves(eqx.filter(model, eqx.is_array)))
+    print(f"model params: {n_params / 1e6:.2f} M")
+
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adamw(args.lr, weight_decay=1e-4),
     )
+    opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
 
-    # evaluate on fixed validation batch
-    if step % 1000 == 0:
+    # ---- fixed validation batch ----
+    x_val, t_val, v_val = sample_batch(jax.random.key(12345), val_data, batch_size=64)
 
-        v_pred_val = jax.vmap(
-            lambda x, t_: model(x, t_)
-        )(x_val, t_val)
+    # ---- training loop ----
+    loss_history, val_history, val_steps = [], [], []
+    checkpoint_steps = {args.steps // 4, args.steps // 2, 3 * args.steps // 4, args.steps}
 
-        val_mse = jnp.mean(
-            (v_pred_val - v_val) ** 2
+    key_train = jax.random.key(args.seed + 1)
+    for step in range(1, args.steps + 1):
+        key_train, subkey = jax.random.split(key_train)
+        x_t, t, v_target = sample_batch(subkey, train_data, args.batch_size)
+        model, ema_model, opt_state, loss = train_step(
+            model, ema_model, opt_state, x_t, t, v_target, optimizer, args.ema_decay
         )
+        loss_history.append(float(loss))
 
-        val_mse_history.append(val_mse)
-        
-        loss_history.append(loss)
-
-        print(
-            f"step {step}, "
-            f"train loss, density {loss:.4f},"
-            f"val mse {val_mse:.4f}"
-        )
+        if step % 500 == 0:
+            val_mse = float(loss_function(ema_model, x_val, t_val, v_val))
+            val_history.append(val_mse)
+            val_steps.append(step)
+            print(f"step {step:6d} | train {float(loss):.4f} | val(ema) {val_mse:.4f}",
+                  flush=True)
 
         if step in checkpoint_steps:
-            filepath = f"unet_checkpoints/unet_velocity_field_{step}.eqx"
-            unet_flow_film.save_model(model, filepath)
-            
+            unet_flow_film.save_model(model, os.path.join(args.ckpt_dir, f"unet_{step}.eqx"))
+            unet_flow_film.save_model(ema_model, os.path.join(args.ckpt_dir, f"unet_ema_{step}.eqx"))
 
-# ==========================================================================
-#  plot training history
-# ==========================================================================
+    # ---- final checkpoints ----
+    unet_flow_film.save_model(model, os.path.join(args.ckpt_dir, "unet_final.eqx"))
+    unet_flow_film.save_model(ema_model, os.path.join(args.ckpt_dir, "unet_ema_final.eqx"))
+    print("saved final checkpoints")
 
-plt.figure()
-plt.plot(loss_history)
-plt.yscale("log")
-plt.xlabel("step")
-plt.ylabel("loss")
-plt.title("Training loss")
-plt.savefig("loss_history.png")
+    # ---- plots ----
+    plt.figure()
+    plt.plot(loss_history, alpha=0.4, label="train (per step)")
+    # smoothed
+    if len(loss_history) > 100:
+        w = 100
+        smooth = np.convolve(loss_history, np.ones(w) / w, mode="valid")
+        plt.plot(np.arange(w - 1, len(loss_history)), smooth, label="train (smoothed)")
+    plt.plot(val_steps, val_history, "o-", label="val (ema)")
+    plt.yscale("log")
+    plt.xlabel("step")
+    plt.ylabel("MSE loss")
+    plt.legend()
+    plt.title("Rectified-flow training")
+    plt.savefig("loss_history.png", dpi=120)
+    print("wrote loss_history.png")
 
-plt.figure()
-plt.plot(
-    np.arange(len(val_mse_history)) * 100,
-    val_mse_history
-)
-plt.yscale("log")
-plt.xlabel("step")
-plt.ylabel("validation MSE")
-plt.title("Validation velocity MSE")
-plt.savefig("val_mse_history.png")
+
+if __name__ == "__main__":
+    main()

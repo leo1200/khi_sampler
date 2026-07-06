@@ -13,3 +13,7 @@
 /100k_figures
 /analysis
 /four_channels
+__pycache__/
+*.pyc
+/loss_history.png
+/val_mse_history.png

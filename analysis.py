@@ -4,71 +4,56 @@ autocvd(num_gpus=1)
 # ruff: noqa: E402
 # =======================
 
+# ==========================================================================
+#  Physical analysis of generated vs. real KHI fields
+#
+#  Compares generated samples (from sample.py) against real simulation data
+#  along physically meaningful statistics:
+#    * per-channel value distributions (PDFs)
+#    * density power spectrum P(k)
+#    * kinetic energy spectrum E(k)
+# ==========================================================================
+
+import argparse
+import glob
+import math
+import os
+
 import jax.numpy as jnp
 import numpy as np
-import math
-import glob
 import matplotlib.pyplot as plt
-import seaborn as sns
 
-
-# ==========================================================================
-#  Physical analysis
-# ==========================================================================
+CHANNELS = ["density", "velocity_x", "velocity_y", "pressure"]
 
 # ==========================================================================
 #  Binning mode constants
 # ==========================================================================
 
-LOG_BINNING = 0       # Logarithmic bins — constant dk/k, smoothest at high k
-INTEGER_BINNING = 1   # Integer mode shells — dk = 2*pi/L, good statistics per bin
-PHYSICAL_BINNING = 2  # Physical wavenumber — dk = 1, finest resolution (default)
+LOG_BINNING = 0
+INTEGER_BINNING = 1
+PHYSICAL_BINNING = 2
 
-
-# ==========================================================================
-#  Shared helpers
-# ==========================================================================
 
 def _wavenumber_bins2d(Nx, Ny, binning=PHYSICAL_BINNING):
-    """
-    Compute shell-binning indices for spectral accumulation.
-
-    Args:
-        Nx, Ny: Grid dimensions.
-        binning: One of LOG_BINNING, INTEGER_BINNING, PHYSICAL_BINNING.
-
-    Returns:
-        k_idx: Flat int32 bin indices, shape (Nx*Ny).
-        n_bins: Number of bins.
-        k_centers: Physical wavenumber bin centers, shape (n_bins,).
-    """
-    freq_x = jnp.fft.fftfreq(Nx, d=1.0 / Nx)  # integer mode numbers
+    """Shell-binning indices for spectral accumulation."""
+    freq_x = jnp.fft.fftfreq(Nx, d=1.0 / Nx)
     freq_y = jnp.fft.fftfreq(Ny, d=1.0 / Ny)
     FX, FY = jnp.meshgrid(freq_x, freq_y, indexing="ij")
-
-    m_mag = jnp.sqrt(FX**2 + FY**2)  # integer mode magnitude
+    m_mag = jnp.sqrt(FX**2 + FY**2)
     max_mode = math.sqrt((Nx // 2) ** 2 + (Ny // 2) ** 2)
 
     if binning == LOG_BINNING:
-        k_min = 1.0
-        k_max = max_mode
+        k_min, k_max = 1.0, max_mode
         n_bins = max(Nx, Ny) // 4
-        log_edges = jnp.logspace(
-            jnp.log10(k_min * 0.5), jnp.log10(k_max + 0.5), n_bins + 1
-        )
-        k_idx = jnp.clip(
-            jnp.digitize(m_mag.ravel(), log_edges) - 1, 0, n_bins - 1
-        )
-        # Geometric mean of edges, converted to physical wavenumber
+        log_edges = jnp.logspace(jnp.log10(k_min * 0.5), jnp.log10(k_max + 0.5), n_bins + 1)
+        k_idx = jnp.clip(jnp.digitize(m_mag.ravel(), log_edges) - 1, 0, n_bins - 1)
         k_centers = 2.0 * jnp.pi * jnp.sqrt(log_edges[:-1] * log_edges[1:])
         return k_idx, n_bins, k_centers
-
     elif binning == INTEGER_BINNING:
         k_idx = m_mag.astype(jnp.int32).ravel()
         n_bins = int(max_mode) + 2
         k_centers = (jnp.arange(n_bins) + 0.5) * 2.0 * jnp.pi
         return k_idx, n_bins, k_centers
-
     else:  # PHYSICAL_BINNING
         k_phys = 2.0 * jnp.pi * m_mag
         k_idx = k_phys.astype(jnp.int32).ravel()
@@ -78,159 +63,133 @@ def _wavenumber_bins2d(Nx, Ny, binning=PHYSICAL_BINNING):
 
 
 # ==========================================================================
-#  Generic spectrum functions
+#  Spectra
 # ==========================================================================
 
-def vector_field_energy_spectrum(fx, fy, energy_coeff=1.0,
-                                binning=PHYSICAL_BINNING):
-    """
-    Energy spectrum E(k) of a vector field (fx, fy).
-
-    Satisfies: sum(E(k)) == mean(c * |f|^2) over the domain
-    (shell-summed convention).
-
-    Args:
-        fx, fy: Field components, each shaped (Nx, Ny).
-        energy_coeff: Scalar multiplier c (default 1.0).
-        binning: LOG_BINNING, INTEGER_BINNING, or PHYSICAL_BINNING.
-
-    Returns:
-        k_centers: Physical wavenumber bin centers.
-        Ek: Energy spectrum per bin.
-
-    Based on: https://qiauil.github.io/blog/2026/tke_spectrum/ and https://github.com/leo1200/astronomix/blob/main/astronomix/analysis_helpers/energy_spectrum.py
-    """
+def vector_field_energy_spectrum(fx, fy, energy_coeff=1.0, binning=PHYSICAL_BINNING):
+    """Energy spectrum E(k) of a vector field (fx, fy)."""
     Nx, Ny = fx.shape
     N_total = float(Nx * Ny)
-
     fx_hat = jnp.fft.fftn(fx)
     fy_hat = jnp.fft.fftn(fy)
-
-    energy_fft = energy_coeff * (
-        jnp.abs(fx_hat) ** 2 + jnp.abs(fy_hat) ** 2
-        ) / N_total**2
-
+    energy_fft = energy_coeff * (jnp.abs(fx_hat) ** 2 + jnp.abs(fy_hat) ** 2) / N_total**2
     k_idx, n_bins, k_centers = _wavenumber_bins2d(Nx, Ny, binning)
     Ek = jnp.zeros(n_bins).at[k_idx].add(energy_fft.ravel())
     return k_centers, Ek
 
-# -------------------------------------------------------------------------
-# HD physics wrapper
-# -------------------------------------------------------------------------
 
 def get_kinetic_energy_spectrum(vx, vy, rho, binning=PHYSICAL_BINNING):
+    """Density-weighted kinetic energy spectrum (w = sqrt(rho) * u)."""
+    rho_sqrt = jnp.sqrt(jnp.clip(rho, 1e-6))
+    return vector_field_energy_spectrum(rho_sqrt * vx, rho_sqrt * vy,
+                                        energy_coeff=0.5, binning=binning)
+
+
+def density_power_spectrum(rho):
+    """Radially-averaged power spectrum P(k) for a stack of density fields.
+
+    rho.shape = (n_data, N, N) -> returns (k_centers, Pk_all[n_data, n_bins]).
     """
-    Kinetic energy spectrum with density weighting.
-
-    Uses w = sqrt(rho) * u so that sum(E_k) == mean(0.5 * rho * |u|^2).
-
-    Args:
-        vx, vy, vz: Velocity components, each (Nx, Ny, Nz).
-        rho: Density field, (Nx, Ny, Nz).
-        binning: LOG_BINNING, INTEGER_BINNING, or PHYSICAL_BINNING.
-
-    Returns:
-        k_centers, Ek: Wavenumber bin centers and kinetic energy spectrum.
-    """
-    rho_sqrt = jnp.sqrt(rho)
-    return vector_field_energy_spectrum(
-        rho_sqrt * vx, rho_sqrt * vy,
-        energy_coeff=0.5, binning=binning,
-    )
-
-
-def rho_power_spectrum(rho):
-    """
-    Compute the power spectrum P(k) for density.
-    rho.shape = (n_data, 256, 256)
-    return a list containing the power spectrum for all data
-    """
-
     rho = rho - rho.mean(axis=(-2, -1), keepdims=True)
     n_data, N, _ = rho.shape
-
-    # FFT
     rho_hat = jnp.fft.fft2(rho, axes=(-2, -1))
-    power = jnp.abs(rho_hat)**2 
-
-    # k grid 
+    power = jnp.abs(rho_hat) ** 2
     k_idx, n_bins, k_centers = _wavenumber_bins2d(N, N, binning=PHYSICAL_BINNING)
-    k_idx = jnp.reshape(k_idx, shape=(N,N))
     k_idx_flat = k_idx.ravel()
-    
-    # allocate output
+    counts = jnp.bincount(k_idx_flat, length=n_bins)
     Pk_all = []
-
     for j in range(n_data):
-        p = power[j].ravel()
-
-        # sum of power per bin
-        Pk = jnp.bincount(
-            k_idx_flat,
-            weights=p,
-            length=n_bins
-        )
-
-        # number of modes per bin (normalization)
-        counts = jnp.bincount(
-            k_idx_flat,
-            length=n_bins
-        )
-
-        # avoid division by zero
-        Pk = jnp.where(counts > 0, Pk / counts, 0.0)
-
+        Pk = jnp.bincount(k_idx_flat, weights=power[j].ravel(), length=n_bins)
+        Pk = jnp.where(counts > 0, Pk / jnp.clip(counts, 1), 0.0)
         Pk_all.append(Pk)
-
     return k_centers, jnp.stack(Pk_all)
 
 
-def density_distribution(rho_gen, rho_real):
-    """
-    Create and plot a density distribution for comparison of p(rho_real) and p(rho_gen).
-    rho_gen.shape = (n_data, 256, 256)
-    rho_real.shape = (n_data, 256, 256)
-    """
-
-    # flatten data for seaborn distplot
-    rho_gen = rho_gen.flatten()
-    rho_real = rho_real.flatten()
-
-    fig, ax = plt.subplots()
-    sns.kdeplot(rho_real, ax=ax, label="real data")
-    sns.kdeplot(rho_gen, ax=ax, color="r", label="generated data")
-    plt.xlabel("$\\rho$")
-    plt.ylabel("$P(\\rho)$")
-    plt.legend()
-    plt.savefig("sns_distplot.png")
-    
 # ==========================================================================
-#  Statistical analysis
+#  Plots
 # ==========================================================================
 
-def calculate_fid(x, y):    
-    mu_x, sigma_x = jnp.mean(x, axis=0), np.cov(x)
-    mu_y, sigma_y = jnp.mean(y, axis=0), np.cov(y)
+def plot_value_distributions(gen, real, out_path):
+    """Histogram PDFs per channel: generated vs real."""
+    fig, axes = plt.subplots(1, 4, figsize=(20, 4))
+    for c, name in enumerate(CHANNELS):
+        ax = axes[c]
+        g = np.asarray(gen[:, c]).ravel()
+        r = np.asarray(real[:, c]).ravel()
+        lo = min(g.min(), r.min())
+        hi = max(g.max(), r.max())
+        bins = np.linspace(lo, hi, 120)
+        ax.hist(r, bins=bins, density=True, histtype="step", label="real", color="k")
+        ax.hist(g, bins=bins, density=True, histtype="step", label="generated", color="r")
+        ax.set_title(name)
+        ax.set_xlabel("value")
+        ax.set_yscale("log")
+        ax.legend()
+    axes[0].set_ylabel("PDF")
+    fig.suptitle("Value distributions: generated vs real")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=110)
+    plt.close(fig)
+    print(f"wrote {out_path}")
 
-    covmean = jnp.sqrtm(sigma_x @ sigma_y)
-    # check if covmean is complex and if so set all values to real
-    if np.iscomplexobject(covmean):
-        covmean = covmean.real
-    
-    d = (mu_x - mu_y)**2 + jnp.linalg.trace(sigma_x + sigma_y - 2*jnp.sqrt(covmean))
 
-    return d
+def plot_spectra(gen, real, out_path):
+    """Mean density power spectrum and kinetic energy spectrum."""
+    kd, Pk_gen = density_power_spectrum(gen[:, 0])
+    _, Pk_real = density_power_spectrum(real[:, 0])
+
+    ke_gen = np.stack([np.asarray(get_kinetic_energy_spectrum(
+        gen[i, 1], gen[i, 2], gen[i, 0])[1]) for i in range(len(gen))])
+    ke_k, _ = get_kinetic_energy_spectrum(real[0, 1], real[0, 2], real[0, 0])
+    ke_real = np.stack([np.asarray(get_kinetic_energy_spectrum(
+        real[i, 1], real[i, 2], real[i, 0])[1]) for i in range(len(real))])
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
+
+    def _band(ax, k, spec, color, label):
+        m = np.asarray(spec).mean(0)
+        ax.loglog(k, m, color=color, label=label)
+
+    _band(ax1, kd, Pk_real, "k", "real")
+    _band(ax1, kd, Pk_gen, "r", "generated")
+    ax1.set_title("Density power spectrum P(k)")
+    ax1.set_xlabel("k"); ax1.set_ylabel("P(k)"); ax1.legend()
+    ax1.set_xlim(1, None)
+
+    _band(ax2, ke_k, ke_real, "k", "real")
+    _band(ax2, ke_k, ke_gen, "r", "generated")
+    ax2.set_title("Kinetic energy spectrum E(k)")
+    ax2.set_xlabel("k"); ax2.set_ylabel("E(k)"); ax2.legend()
+    ax2.set_xlim(1, None)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=110)
+    plt.close(fig)
+    print(f"wrote {out_path}")
 
 
 # ==========================================================================
-#  Data import 
+#  main
 # ==========================================================================
 
-files = sorted(glob.glob("unet_generations/test_generation_*.npy"))
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--gen", type=str, default="unet_generations/generations.npy")
+    parser.add_argument("--data-dir", type=str, default="data")
+    parser.add_argument("--out-dir", type=str, default="unet_generations")
+    args = parser.parse_args()
 
-generations = np.stack([np.load(f)for f in files]) 
-print(generations.shape)
+    os.makedirs(args.out_dir, exist_ok=True)
 
-k_centers, Pk_all = rho_power_spectrum(generations)
-plt.plot(k_centers, Pk_all[0])
-plt.savefig('power_spec_test.png')
+    gen = np.load(args.gen).astype(np.float32)  # (N, 4, 256, 256)
+    real_files = sorted(glob.glob(os.path.join(args.data_dir, "final_state_*.npy")))
+    n = min(len(gen), len(real_files))
+    real = np.stack([np.load(f) for f in real_files[:max(n, 64)]]).astype(np.float32)
+    print(f"generated: {gen.shape}, real: {real.shape}")
+
+    plot_value_distributions(gen, real, os.path.join(args.out_dir, "value_distributions.png"))
+    plot_spectra(gen, real, os.path.join(args.out_dir, "spectra.png"))
+
+
+if __name__ == "__main__":
+    main()
