@@ -1,8 +1,7 @@
 # ==== GPU / XLA memory configuration (must precede any JAX import) ====
 import os as _os
-# Disable XLA convolution autotuning (probes 30+ GiB scratch -> OOM on shared
-# GPUs). setdefault: a parent script that already set this wins.
-_os.environ.setdefault("XLA_FLAGS", "--xla_gpu_autotune_level=0")
+# Allocate GPU memory on demand rather than grabbing ~75% up front (keeps peak
+# memory low, avoids the newer-JAX OOM). setdefault: a parent script wins.
 _os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 # ==== GPU selection ====

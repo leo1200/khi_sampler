@@ -1,13 +1,12 @@
 # ==== GPU / XLA memory configuration (must precede any JAX import) ====
 import os as _os
-# Disable XLA convolution autotuning: it probes 30+ GiB scratch buffers just to
-# benchmark cuDNN algorithms, which causes fatal OOM on shared/contended GPUs
-# (and on newer XLA that no longer backs off). cuDNN's default heuristic is used
-# instead — slightly slower per step, faster to compile, and it never OOMs.
-# (batch 16, 256^2: this alone cut peak memory 12.5 GB -> 8.2 GB.)
-_os.environ.setdefault("XLA_FLAGS", "--xla_gpu_autotune_level=0")
-# Allocate GPU memory on demand instead of grabbing ~75% up front, so training
-# coexists with other users on the shared node.
+# Allocate GPU memory on demand instead of grabbing ~75% of the card up front.
+# This is what keeps peak memory low and avoids the OOM seen on newer JAX/XLA:
+# with a full preallocated pool, XLA's rematerialization pass targets that whole
+# budget and convolution autotuning probes 30+ GiB scratch buffers, which OOMs
+# on a contended card. On-demand allocation (plus gradient checkpointing in the
+# model) keeps the batch-16 256^2 train step at ~5.7 GB. Autotuning is left ON —
+# disabling it made each step ~22x slower.
 _os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 # ==== GPU selection ====

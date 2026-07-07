@@ -165,28 +165,28 @@ $PY analysis.py
 ## GPU memory / avoiding OOM
 
 Training a 256² U-Net can OOM on a shared GPU, especially on newer JAX/XLA.
-Three mitigations are built into the scripts so nothing needs to be set on the
-command line:
+Two mitigations are built into the scripts (set before JAX imports, so nothing
+is needed on the command line), chosen to **keep full training speed**:
 
-- **Conv autotuning disabled** (`XLA_FLAGS=--xla_gpu_autotune_level=0`, set via
-  `os.environ` before JAX is imported). XLA's convolution autotuner probes
-  30–40 GiB scratch buffers just to benchmark cuDNN algorithms; on a contended
-  card (or with newer XLA that runs these probes on many compile threads at
-  once) that is a hard OOM. The default cuDNN heuristic is used instead —
-  marginally slower per step, faster to compile, never OOMs.
-- **On-demand allocation** (`XLA_PYTHON_CLIENT_PREALLOCATE=false`) so a job
-  grabs only what it needs instead of ~75% of the card, coexisting with others.
+- **On-demand allocation** (`XLA_PYTHON_CLIENT_PREALLOCATE=false`). This is the
+  key fix. With the default preallocated pool (~75% of the card), XLA's
+  rematerialization pass targets that whole budget and convolution autotuning
+  probes 30–40 GiB scratch buffers — a hard OOM on a contended card or on newer
+  XLA (which runs those probes on many compile threads at once). Allocating on
+  demand keeps the pool small and side-steps both.
 - **Gradient checkpointing** on the ResBlocks (`unet_flow_film.USE_CHECKPOINT`,
   default on; disable with `KHI_CHECKPOINT=0`). Recomputes activations in the
-  backward pass. On JAX 0.10 this brings the batch-16 train step to ~5.7 GB.
+  backward pass — only **~+10 %** step time, and it roughly halves activation
+  memory.
 
-Measured peak for the batch-16 train step: **~5.7 GB** with checkpointing
-(≈8.2 GB without). If you still hit OOM, drop `--batch-size` to 8.
+Measured (batch 16, 256²): peak **~5.7 GB** with checkpointing (≈8.2 GB
+without), at **~0.2 s/step**. If you still hit OOM, drop `--batch-size` to 8.
 
-Note: setting `XLA_FLAGS=…` on its own shell line does **not** export it to the
-`python` process — prefix the command (`XLA_FLAGS=… python training.py`) or
-`export` it. The scripts already set it internally, so this is only relevant if
-you override it manually.
+> ⚠️ Convolution **autotuning is deliberately left on**. Disabling it
+> (`XLA_FLAGS=--xla_gpu_autotune_level=0`) removes the scratch probes but makes
+> cuDNN fall back to a pathologically slow kernel — **~50× slower** per step
+> (~10 s vs ~0.2 s). It is not worth it; on-demand allocation solves the OOM
+> without the speed penalty.
 
 ## Files
 
