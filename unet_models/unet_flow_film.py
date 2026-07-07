@@ -1,3 +1,10 @@
+# ==== GPU / XLA memory configuration (must precede any JAX import) ====
+import os as _os
+# Disable XLA convolution autotuning (probes 30+ GiB scratch -> OOM on shared
+# GPUs). setdefault: a parent script that already set this wins.
+_os.environ.setdefault("XLA_FLAGS", "--xla_gpu_autotune_level=0")
+_os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
 # ==== GPU selection ====
 from autocvd import autocvd
 autocvd(num_gpus=1)
@@ -19,6 +26,8 @@ autocvd(num_gpus=1)
 #    list of widths so there is no fragile hand-tuned channel arithmetic.
 # ==========================================================================
 
+import os as _os
+
 import jax
 import jax.numpy as jnp
 import equinox as eqx
@@ -35,6 +44,12 @@ TIME_CHANNELS = FOURIER_DIM * 2   # dim of the raw fourier embedding
 TIME_EMB = 256              # dim of the processed time embedding fed to FiLM
 GROUPS = 8
 MAX_PERIOD = 1000.0
+
+# Gradient checkpointing (rematerialization): recompute ResBlock activations in
+# the backward pass instead of storing them. Cuts peak activation memory ~2-4x
+# for ~30% extra compute, so training fits even on a partly-occupied GPU.
+# Disable with the environment variable KHI_CHECKPOINT=0.
+USE_CHECKPOINT = _os.environ.get("KHI_CHECKPOINT", "1") != "0"
 
 
 # ==========================================================================
@@ -124,6 +139,26 @@ class Upsample(eqx.Module):
 
 
 # ==========================================================================
+#  checkpointed block runner
+# ==========================================================================
+
+def _run_block(block, x, t_emb):
+    return block(x, t_emb)
+
+
+# Rematerialized variant: forward activations inside the block are recomputed
+# during the backward pass rather than stored. filter_checkpoint treats the
+# block's weight arrays as differentiable inputs, so gradients still flow.
+_run_block_ckpt = eqx.filter_checkpoint(_run_block)
+
+
+def run_block(block, x, t_emb):
+    if USE_CHECKPOINT:
+        return _run_block_ckpt(block, x, t_emb)
+    return _run_block(block, x, t_emb)
+
+
+# ==========================================================================
 #  U-Net
 # ==========================================================================
 
@@ -178,17 +213,17 @@ class UNet(eqx.Module):
 
         skips = []
         for block, down in zip(self.down_blocks, self.downsamples):
-            h = block(h, t_emb)
+            h = run_block(block, h, t_emb)
             skips.append(h)
             h = down(h)
 
-        h = self.mid1(h, t_emb)
-        h = self.mid2(h, t_emb)
+        h = run_block(self.mid1, h, t_emb)
+        h = run_block(self.mid2, h, t_emb)
 
         for up, block, skip in zip(self.upsamples, self.up_blocks, reversed(skips)):
             h = up(h)
             h = jnp.concatenate([h, skip], axis=0)
-            h = block(h, t_emb)
+            h = run_block(block, h, t_emb)
 
         h = jax.nn.silu(self.out_norm(h))
         return self.out_conv(h)

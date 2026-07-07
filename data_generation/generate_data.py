@@ -1,3 +1,8 @@
+# ==== GPU / XLA memory configuration (must precede any JAX import) ====
+import os as _os
+_os.environ.setdefault("XLA_FLAGS", "--xla_gpu_autotune_level=0")
+_os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
 # ==== GPU selection ====
 from autocvd import autocvd
 autocvd(num_gpus=1)

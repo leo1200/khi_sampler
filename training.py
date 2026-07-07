@@ -1,3 +1,15 @@
+# ==== GPU / XLA memory configuration (must precede any JAX import) ====
+import os as _os
+# Disable XLA convolution autotuning: it probes 30+ GiB scratch buffers just to
+# benchmark cuDNN algorithms, which causes fatal OOM on shared/contended GPUs
+# (and on newer XLA that no longer backs off). cuDNN's default heuristic is used
+# instead — slightly slower per step, faster to compile, and it never OOMs.
+# (batch 16, 256^2: this alone cut peak memory 12.5 GB -> 8.2 GB.)
+_os.environ.setdefault("XLA_FLAGS", "--xla_gpu_autotune_level=0")
+# Allocate GPU memory on demand instead of grabbing ~75% up front, so training
+# coexists with other users on the shared node.
+_os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
 # ==== GPU selection ====
 from autocvd import autocvd
 autocvd(num_gpus=1)
@@ -133,7 +145,11 @@ def main():
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
 
     # ---- fixed validation batch ----
-    x_val, t_val, v_val = sample_batch(jax.random.key(12345), val_data, batch_size=64)
+    # Use the same batch size as training: a larger eager val batch is a needless
+    # peak-memory spike (evaluated without jit/checkpointing) that can OOM on a
+    # busy GPU right at the eval step.
+    x_val, t_val, v_val = sample_batch(jax.random.key(12345), val_data, args.batch_size)
+    val_loss_fn = eqx.filter_jit(loss_function)  # compiled once, reused every eval
 
     # ---- training loop ----
     loss_history, val_history, val_steps = [], [], []
@@ -149,7 +165,7 @@ def main():
         loss_history.append(float(loss))
 
         if step % 500 == 0:
-            val_mse = float(loss_function(ema_model, x_val, t_val, v_val))
+            val_mse = float(val_loss_fn(ema_model, x_val, t_val, v_val))
             val_history.append(val_mse)
             val_steps.append(step)
             print(f"step {step:6d} | train {float(loss):.4f} | val(ema) {val_mse:.4f}",

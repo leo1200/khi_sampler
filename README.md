@@ -162,12 +162,38 @@ $PY sample.py --ckpt unet_checkpoints/unet_ema_final.eqx --num-samples 8
 $PY analysis.py
 ```
 
+## GPU memory / avoiding OOM
+
+Training a 256² U-Net can OOM on a shared GPU, especially on newer JAX/XLA.
+Three mitigations are built into the scripts so nothing needs to be set on the
+command line:
+
+- **Conv autotuning disabled** (`XLA_FLAGS=--xla_gpu_autotune_level=0`, set via
+  `os.environ` before JAX is imported). XLA's convolution autotuner probes
+  30–40 GiB scratch buffers just to benchmark cuDNN algorithms; on a contended
+  card (or with newer XLA that runs these probes on many compile threads at
+  once) that is a hard OOM. The default cuDNN heuristic is used instead —
+  marginally slower per step, faster to compile, never OOMs.
+- **On-demand allocation** (`XLA_PYTHON_CLIENT_PREALLOCATE=false`) so a job
+  grabs only what it needs instead of ~75% of the card, coexisting with others.
+- **Gradient checkpointing** on the ResBlocks (`unet_flow_film.USE_CHECKPOINT`,
+  default on; disable with `KHI_CHECKPOINT=0`). Recomputes activations in the
+  backward pass. On JAX 0.10 this brings the batch-16 train step to ~5.7 GB.
+
+Measured peak for the batch-16 train step: **~5.7 GB** with checkpointing
+(≈8.2 GB without). If you still hit OOM, drop `--batch-size` to 8.
+
+Note: setting `XLA_FLAGS=…` on its own shell line does **not** export it to the
+`python` process — prefix the command (`XLA_FLAGS=… python training.py`) or
+`export` it. The scripts already set it internally, so this is only relevant if
+you override it manually.
+
 ## Files
 
 | File | Role |
 |------|------|
 | `data_generation/generate_data.py` | astronomix KHI sims → `data/final_state_*.npy` `(4,256,256)` |
-| `unet_models/unet_flow_film.py` | rectified-flow U-Net (DDPM-style ResBlocks + FiLM time conditioning) |
+| `unet_models/unet_flow_film.py` | rectified-flow U-Net (DDPM-style ResBlocks + FiLM + gradient checkpointing) |
 | `training.py` | per-channel normalisation (stats saved), EMA weights, grad clipping |
 | `sample.py` | Heun sampler + denormalisation + `overview_2x4.png` (true vs synthetic) |
 | `analysis.py` | value PDFs and density/kinetic-energy spectra, generated vs real |
